@@ -27,8 +27,65 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 )
+
+// Linux installs a read-only getsockopt implementation before tests start.
+var flowReceiveBuffer = func(net.Conn) (int, error) {
+	return 0, fmt.Errorf("SO_RCVBUF unavailable on %s", runtime.GOOS)
+}
+
+func configureFlowDiagnostics(t *testing.T, server *ServerConfig, client *ConnectOptions) string {
+	if os.Getenv("GRPC_FLOW_DIAGNOSTICS") != "1" {
+		return ""
+	}
+	mode := os.Getenv("GRPC_FLOW_MODE")
+	if mode == "" {
+		mode = "baseline"
+	}
+	switch mode {
+	case "baseline", "socket-buffer":
+	case "read-buffer":
+		server.ReadBufferSize, client.ReadBufferSize = 32<<10, 32<<10
+	case "read-write-buffer":
+		server.ReadBufferSize, client.ReadBufferSize = 32<<10, 32<<10
+		server.WriteBufferSize, client.WriteBufferSize = 32<<10, 32<<10
+	default:
+		t.Fatalf("unknown GRPC_FLOW_MODE %q", mode)
+	}
+	fmt.Fprintf(os.Stderr, "FLOW_CONTROL_START test=%s mode=%s gomaxprocs=%d server_read_buffer=%d client_read_buffer=%d server_write_buffer=%d client_write_buffer=%d\n", t.Name(), mode, runtime.GOMAXPROCS(0), server.ReadBufferSize, client.ReadBufferSize, server.WriteBufferSize, client.WriteBufferSize)
+	return mode
+}
+
+func prepareFlowSockets(t *testing.T, mode string, client *http2Client, server *http2Server) {
+	if mode == "" {
+		return
+	}
+	for _, endpoint := range []struct {
+		side   string
+		conn   net.Conn
+		framer *framer
+	}{{"client", client.conn, client.framer}, {"server", server.conn, server.framer}} {
+		before, beforeErr := flowReceiveBuffer(endpoint.conn)
+		requested := 0
+		if mode == "socket-buffer" {
+			conn, ok := endpoint.conn.(*net.TCPConn)
+			if !ok {
+				t.Fatalf("socket-buffer control requires TCP, got %T", endpoint.conn)
+			}
+			requested = 1 << 20
+			if err := conn.SetReadBuffer(requested); err != nil {
+				t.Fatalf("%s SetReadBuffer(%d): %v", endpoint.side, requested, err)
+			}
+		}
+		after, afterErr := flowReceiveBuffer(endpoint.conn)
+		fmt.Fprintf(os.Stderr, "FLOW_CONTROL_SOCKET test=%s mode=%s side=%s local=%s remote=%s requested_rcvbuf=%d before_rcvbuf=%d before_error=%v so_rcvbuf=%d error=%v reader=%T writer_batch=%d\n", t.Name(), mode, endpoint.side, endpoint.conn.LocalAddr(), endpoint.conn.RemoteAddr(), requested, before, beforeErr, after, afterErr, endpoint.framer.reader, endpoint.framer.writer.batchSize)
+		if runtime.GOOS == "linux" && afterErr != nil {
+			t.Fatalf("%s SO_RCVBUF readback: %v", endpoint.side, afterErr)
+		}
+	}
+}
 
 // Local investigation only. Snapshots are individually synchronized, not atomic
 // across the transport. Never read loopy-owned fields from the watchdog.
@@ -85,6 +142,13 @@ func startFlowDiagnostics(name string, client *http2Client, server *http2Server,
 			}
 			flowControlSnapshot("client", client.controlBuf)
 			flowControlSnapshot("server", server.controlBuf)
+			for _, endpoint := range []struct {
+				side string
+				conn net.Conn
+			}{{"client", client.conn}, {"server", server.conn}} {
+				rcvbuf, err := flowReceiveBuffer(endpoint.conn)
+				fmt.Fprintf(os.Stderr, "%s so_rcvbuf=%d error=%v\n", endpoint.side, rcvbuf, err)
+			}
 			for _, stream := range streams {
 				mu.Lock()
 				p := states[stream.id]
@@ -119,7 +183,7 @@ func flowControlSnapshot(side string, buffer *controlBuffer) {
 	if buffer.mu.TryLock() {
 		queued, responses, waiting, closed := buffer.list.count, buffer.transportResponseFrames, buffer.consumerWaiting, buffer.closed
 		buffer.mu.Unlock()
-		fmt.Fprintf(os.Stderr, "%s control queued=%d responses=%d waiting=%v closed=%v throttled=%v\n", side, queued, responses, waiting, closed, buffer.trfChan.Load() != nil)
+		fmt.Fprintf(os.Stderr, "%s control queued=%d responses=%d waiting=%v wakeup=%d closed=%v throttled=%v\n", side, queued, responses, waiting, len(buffer.wakeupCh), closed, buffer.trfChan.Load() != nil)
 	}
 }
 

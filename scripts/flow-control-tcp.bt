@@ -1,0 +1,40 @@
+// Fork-only observation of the Linux receive-buffer shrink path.
+// Record only IPv4 loopback sockets; no payloads or external connections.
+kprobe:tcp_prune_queue
+{
+    $sk = (struct sock *)arg0;
+    if ($sk->__sk_common.skc_family == 2 &&
+        $sk->__sk_common.skc_rcv_saddr == 0x0100007f &&
+        $sk->__sk_common.skc_daddr == 0x0100007f) {
+        @socket[tid, cpu] = arg0;
+        @before[tid, cpu] = $sk->sk_rcvbuf;
+        @memory[tid, cpu] = $sk->sk_backlog.rmem_alloc.counter;
+        @incoming[tid, cpu] = ((struct sk_buff *)arg1)->len;
+    }
+}
+
+kretprobe:tcp_prune_queue
+/@socket[tid, cpu]/
+{
+    $sk = (struct sock *)@socket[tid, cpu];
+    $after = $sk->sk_rcvbuf;
+    if ($after < @before[tid, cpu]) {
+        $remote = $sk->__sk_common.skc_dport;
+        printf("TCP_RCVBUF_SHRINK mono_ns=%llu pid=%d comm=%s local_port=%u remote_port=%u before=%u after=%u queued_memory=%u incoming_bytes=%u\n",
+               nsecs, pid, comm, $sk->__sk_common.skc_num,
+               (($remote & 255) << 8) | ($remote >> 8),
+               @before[tid, cpu], $after, @memory[tid, cpu], @incoming[tid, cpu]);
+    }
+    delete(@socket[tid, cpu]);
+    delete(@before[tid, cpu]);
+    delete(@memory[tid, cpu]);
+    delete(@incoming[tid, cpu]);
+}
+
+END
+{
+    clear(@socket);
+    clear(@before);
+    clear(@memory);
+    clear(@incoming);
+}

@@ -25,19 +25,19 @@ jobs:
           - name: i386-a
             arch: '386'
             flags: ''
-            count: 500
+            order: 'baseline read-buffer socket-buffer bufio baseline'
           - name: i386-b
             arch: '386'
             flags: ''
-            count: 500
+            order: 'baseline bufio socket-buffer read-buffer baseline'
           - name: race-a
             arch: amd64
             flags: '-race'
-            count: 100
+            order: 'baseline read-buffer socket-buffer bufio baseline'
           - name: race-b
             arch: amd64
             flags: '-race'
-            count: 100
+            order: 'baseline bufio socket-buffer read-buffer baseline'
     name: ${{ matrix.name }}
     env:
       GOARCH: ${{ matrix.arch }}
@@ -57,34 +57,55 @@ jobs:
           uname -a
           lscpu
           free -h
-          sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_moderate_rcvbuf
+          sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_moderate_rcvbuf net.core.rmem_max
           mkdir -p "$RUNNER_TEMP/flow-control-logs"
           cat /proc/net/netstat /proc/net/snmp /proc/net/softnet_stat > "$RUNNER_TEMP/flow-control-logs/network-before.txt"
           cat /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io > "$RUNNER_TEMP/flow-control-logs/pressure-before.txt"
-      - name: Reproduce with the surrounding suite
+      - name: Prepare TCP tracing
         run: |
+          if ! command -v bpftrace >/dev/null; then
+            sudo timeout --kill-after=5s 120s apt-get update -qq || true
+            sudo timeout --kill-after=5s 120s apt-get install -y --no-install-recommends bpftrace || true
+          fi
+          sudo awk '$3 == "tcp_prune_queue"' /proc/kallsyms
+          if command -v bpftrace >/dev/null; then bpftrace --version; fi
+      - name: Compare TCP controls
+        run: |
+          tracer=''
+          stop_trace() {
+            if [ -n "$tracer" ]; then
+              sudo kill -TERM "$tracer" 2>/dev/null || true
+              wait "$tracer" || true
+            fi
+          }
+          trap stop_trace EXIT
+          if command -v bpftrace >/dev/null && [ -r /sys/kernel/btf/vmlinux ]; then
+            sudo timeout --kill-after=5s --signal=INT 18m bpftrace -B line scripts/flow-control-tcp.bt > "$RUNNER_TEMP/flow-control-logs/kernel-trace.txt" 2>&1 &
+            tracer=$!
+          fi
+          go test ${{ matrix.flags }} -c -o "$RUNNER_TEMP/flow-transport.test" ./internal/transport
           result=0
-          for attempt in 1 2 3; do
-            log="$RUNNER_TEMP/flow-control-logs/suite-$attempt.jsonl"
+          attempt=0
+          for mode in ${{ matrix.order }}; do
+            attempt=$((attempt + 1))
+            log="$RUNNER_TEMP/flow-control-logs/$attempt-$mode.jsonl"
+            export GRPC_FLOW_MODE="$mode"
+            export GRPC_GO_EXPERIMENTAL_HTTP_FRAMER_READ_BUFFER_POOLING=true
+            if [ "$mode" = bufio ]; then
+              export GRPC_FLOW_MODE=read-buffer
+              export GRPC_GO_EXPERIMENTAL_HTTP_FRAMER_READ_BUFFER_POOLING=false
+            fi
             code=0
-            go test ${{ matrix.flags }} -json -cpu 1,4 -count=1 -timeout 7m ./... > "$log" 2>&1 || code=$?
+            go tool test2json -t -p google.golang.org/grpc/internal/transport "$RUNNER_TEMP/flow-transport.test" -test.v=test2json -test.run '^Test$/^AccountCheckWindowSizeWithLargeWindow$' -test.cpu 1,4 -test.count 50 -test.timeout 3m > "$log" 2>&1 || code=$?
             python3 scripts/flow-control-summary.py "$log"
-            if [ "$code" -ne 0 ]; then
-              result="$code"
-            fi
-            if python3 scripts/flow-control-summary.py --target-failed "$log"; then
-              break
-            fi
+            if [ "$code" -ne 0 ]; then result="$code"; fi
           done
-          exit "$result"
-      - name: Repeat the target test
-        if: ${{ always() && !cancelled() }}
-        run: |
-          log="$RUNNER_TEMP/flow-control-logs/target.jsonl"
+          log="$RUNNER_TEMP/flow-control-logs/plain-tcp.jsonl"
           code=0
-          go test ${{ matrix.flags }} -json -run '^Test$/^AccountCheckWindowSizeWithLargeWindow$' -cpu 1,4 -count=${{ matrix.count }} -timeout 7m ./internal/transport > "$log" 2>&1 || code=$?
-          python3 scripts/flow-control-summary.py "$log"
-          exit "$code"
+          timeout --kill-after=5s 120s go run ${{ matrix.flags }} scripts/flow-control-tcp.go -count 100 -procs 1 > "$log" 2>&1 || code=$?
+          python3 scripts/flow-control-summary.py --plain-tcp "$log"
+          if [ "$code" -ne 0 ]; then result="$code"; fi
+          exit "$result"
       - name: Record final network and pressure counters
         if: always()
         run: |

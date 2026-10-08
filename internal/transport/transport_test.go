@@ -1994,6 +1994,7 @@ func testFlowControlAccountCheck(t *testing.T, msgSize int, wc windowSizeConfig,
 		StaticWindowSize:      true,
 		BufferPool:            mem.DefaultBufferPool(),
 	}
+	mode := configureFlowDiagnostics(t, sc, &co)
 	server, client, cancel := setUpWithOptionsAndTimeout(t, 0, sc, pingpong, co, timeout)
 	defer cancel()
 	defer server.stop()
@@ -2012,6 +2013,7 @@ func testFlowControlAccountCheck(t *testing.T, msgSize int, wc windowSizeConfig,
 		st = k.(*http2Server)
 	}
 	server.mu.Unlock()
+	prepareFlowSockets(t, mode, client, st)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
