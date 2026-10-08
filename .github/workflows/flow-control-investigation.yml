@@ -22,26 +22,27 @@ jobs:
       max-parallel: 4
       matrix:
         include:
-          - name: i386-a
+          - name: i386-readyreader
             arch: '386'
             flags: ''
-            order: 'baseline read-buffer socket-buffer bufio baseline'
-          - name: i386-b
+            pooling: 'true'
+          - name: i386-bufio
             arch: '386'
             flags: ''
-            order: 'baseline bufio socket-buffer read-buffer baseline'
-          - name: race-a
+            pooling: 'false'
+          - name: race-readyreader
             arch: amd64
             flags: '-race'
-            order: 'baseline read-buffer socket-buffer bufio baseline'
-          - name: race-b
+            pooling: 'true'
+          - name: race-bufio
             arch: amd64
             flags: '-race'
-            order: 'baseline bufio socket-buffer read-buffer baseline'
+            pooling: 'false'
     name: ${{ matrix.name }}
     env:
       GOARCH: ${{ matrix.arch }}
-      GRPC_FLOW_DIAGNOSTICS: '1'
+      GOWORK: 'off'
+      GRPC_GO_EXPERIMENTAL_HTTP_FRAMER_READ_BUFFER_POOLING: ${{ matrix.pooling }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -51,67 +52,86 @@ jobs:
           go-version: '1.27.1'
           cache: false
       - name: Record environment
+        shell: bash
         run: |
-          go version
-          git rev-parse HEAD
-          uname -a
-          lscpu
-          free -h
-          sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_moderate_rcvbuf net.core.rmem_max
+          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/flow-control-logs"
-          cat /proc/net/netstat /proc/net/snmp /proc/net/softnet_stat > "$RUNNER_TEMP/flow-control-logs/network-before.txt"
-          cat /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io > "$RUNNER_TEMP/flow-control-logs/pressure-before.txt"
-      - name: Prepare TCP tracing
+          {
+            go version
+            git rev-parse HEAD
+            uname -a
+            go env GOOS GOARCH GOTOOLCHAIN GOWORK
+            printf 'HTTP framer read buffer pooling: %s\n' "$GRPC_GO_EXPERIMENTAL_HTTP_FRAMER_READ_BUFFER_POOLING"
+            getconf _NPROCESSORS_ONLN
+            free -h
+            sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_moderate_rcvbuf net.core.rmem_max
+          } | tee "$RUNNER_TEMP/flow-control-logs/environment.txt"
+      - name: Build clean baseline and candidate
+        shell: bash
         run: |
-          if ! command -v bpftrace >/dev/null; then
-            sudo timeout --kill-after=5s 120s apt-get update -qq || true
-            sudo timeout --kill-after=5s 120s apt-get install -y --no-install-recommends bpftrace || true
+          set -euo pipefail
+          base=39ebc82c352a3302c3d7f748b4359e26689d9187
+          source="$RUNNER_TEMP/flow-control-source"
+          logs="$RUNNER_TEMP/flow-control-logs"
+          patch="$GITHUB_WORKSPACE/scripts/flow-control-read-buffer.patch"
+          git fetch --no-tags --depth=1 origin "$base"
+          test "$(git rev-parse "$base^{commit}")" = "$base"
+          mkdir -p "$source"
+          git archive "$base" | tar -x -C "$source"
+          {
+            printf 'Base commit: %s\n' "$base"
+            printf 'Base tree: %s\n' "$(git rev-parse "$base^{tree}")"
+            printf 'Candidate patch: '
+            sha256sum "$patch"
+            printf 'Baseline test source: '
+            sha256sum "$source/internal/transport/transport_test.go"
+          } | tee "$logs/source-hashes.txt"
+          cp "$source/internal/transport/transport_test.go" "$RUNNER_TEMP/baseline-transport_test.go"
+          cp "$patch" "$logs/candidate.patch"
+          cd "$source"
+          go test ${{ matrix.flags }} -c -o "$RUNNER_TEMP/flow-baseline.test" ./internal/transport
+          git apply --check "$patch"
+          git apply "$patch"
+          diff_code=0
+          diff -u --label a/internal/transport/transport_test.go --label b/internal/transport/transport_test.go "$RUNNER_TEMP/baseline-transport_test.go" internal/transport/transport_test.go > "$logs/candidate.diff" || diff_code=$?
+          test "$diff_code" -eq 1
+          cat "$logs/candidate.diff"
+          {
+            printf 'Candidate test source: '
+            sha256sum internal/transport/transport_test.go
+          } | tee -a "$logs/source-hashes.txt"
+          go test ${{ matrix.flags }} -c -o "$RUNNER_TEMP/flow-candidate.test" ./internal/transport
+      - name: Verify clean candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/flow-control-source"
+          logs="$RUNNER_TEMP/flow-control-logs"
+          summarizer="$GITHUB_WORKSPACE/scripts/flow-control-summary.py"
+          baseline_code=0
+          timeout --kill-after=5s 3m go tool test2json -t -p google.golang.org/grpc/internal/transport "$RUNNER_TEMP/flow-baseline.test" -test.v=test2json -test.run '^Test$/^AccountCheckWindowSizeWithLargeWindow$' -test.cpu 1,4 -test.count 50 -test.timeout 3m > "$logs/baseline.jsonl" 2>&1 || baseline_code=$?
+          printf '{"stage":"baseline","exit_code":%s,"planned_target_executions":100}\n' "$baseline_code" | tee -a "$logs/results.jsonl"
+          python3 "$summarizer" "$logs/baseline.jsonl" | tee "$logs/baseline-summary.txt"
+          if [ "$baseline_code" -ne 0 ]; then
+            echo "::notice::Unchanged baseline exited with status $baseline_code; continuing candidate validation."
           fi
-          sudo awk '$3 == "tcp_prune_queue"' /proc/kallsyms
-          if command -v bpftrace >/dev/null; then bpftrace --version; fi
-      - name: Compare TCP controls
-        run: |
-          tracer=''
-          stop_trace() {
-            if [ -n "$tracer" ]; then
-              sudo kill -TERM "$tracer" 2>/dev/null || true
-              wait "$tracer" || true
-            fi
-          }
-          trap stop_trace EXIT
-          if command -v bpftrace >/dev/null && [ -r /sys/kernel/btf/vmlinux ]; then
-            sudo timeout --kill-after=5s --signal=INT 18m bpftrace -B line scripts/flow-control-tcp.bt > "$RUNNER_TEMP/flow-control-logs/kernel-trace.txt" 2>&1 &
-            tracer=$!
-          fi
-          go test ${{ matrix.flags }} -c -o "$RUNNER_TEMP/flow-transport.test" ./internal/transport
-          result=0
-          attempt=0
-          for mode in ${{ matrix.order }}; do
-            attempt=$((attempt + 1))
-            log="$RUNNER_TEMP/flow-control-logs/$attempt-$mode.jsonl"
-            export GRPC_FLOW_MODE="$mode"
-            export GRPC_GO_EXPERIMENTAL_HTTP_FRAMER_READ_BUFFER_POOLING=true
-            if [ "$mode" = bufio ]; then
-              export GRPC_FLOW_MODE=read-buffer
-              export GRPC_GO_EXPERIMENTAL_HTTP_FRAMER_READ_BUFFER_POOLING=false
-            fi
-            code=0
-            go tool test2json -t -p google.golang.org/grpc/internal/transport "$RUNNER_TEMP/flow-transport.test" -test.v=test2json -test.run '^Test$/^AccountCheckWindowSizeWithLargeWindow$' -test.cpu 1,4 -test.count 50 -test.timeout 3m > "$log" 2>&1 || code=$?
-            python3 scripts/flow-control-summary.py "$log"
-            if [ "$code" -ne 0 ]; then result="$code"; fi
-          done
-          log="$RUNNER_TEMP/flow-control-logs/plain-tcp.jsonl"
-          code=0
-          timeout --kill-after=5s 120s go run ${{ matrix.flags }} scripts/flow-control-tcp.go -count 100 -procs 1 > "$log" 2>&1 || code=$?
-          python3 scripts/flow-control-summary.py --plain-tcp "$log"
-          if [ "$code" -ne 0 ]; then result="$code"; fi
-          exit "$result"
-      - name: Record final network and pressure counters
-        if: always()
-        run: |
-          cat /proc/net/netstat /proc/net/snmp /proc/net/softnet_stat > "$RUNNER_TEMP/flow-control-logs/network-after.txt"
-          cat /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io > "$RUNNER_TEMP/flow-control-logs/pressure-after.txt"
-      - name: Retain diagnostic evidence
+          candidate_code=0
+          timeout --kill-after=5s 10m go tool test2json -t -p google.golang.org/grpc/internal/transport "$RUNNER_TEMP/flow-candidate.test" -test.v=test2json -test.run '^Test$/^AccountCheckWindowSizeWithLargeWindow$' -test.cpu 1,4 -test.count 500 -test.timeout 10m > "$logs/candidate.jsonl" 2>&1 || candidate_code=$?
+          printf '{"stage":"candidate","exit_code":%s,"planned_target_executions":1000}\n' "$candidate_code" | tee -a "$logs/results.jsonl"
+          python3 "$summarizer" "$logs/candidate.jsonl" | tee "$logs/candidate-summary.txt"
+          root_code=0
+          timeout --kill-after=5s 9m go test -json ${{ matrix.flags }} -cpu 1,4 -timeout 7m ./... > "$logs/root-module.jsonl" 2>&1 || root_code=$?
+          printf '{"stage":"root-module","exit_code":%s}\n' "$root_code" | tee -a "$logs/results.jsonl"
+          python3 "$summarizer" "$logs/root-module.jsonl" | tee "$logs/root-module-summary.txt"
+          {
+            printf '| Stage | Exit status |\n| --- | --- |\n'
+            printf '| Unchanged baseline (100 planned target executions) | %s |\n' "$baseline_code"
+            printf '| Candidate (1000 planned target executions) | %s |\n' "$candidate_code"
+            printf '| Candidate root module | %s |\n' "$root_code"
+            printf '\nBaseline failures are recorded independently. Candidate and root-module results determine the job result.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+          test "$candidate_code" -eq 0 && test "$root_code" -eq 0
+      - name: Retain verification evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
