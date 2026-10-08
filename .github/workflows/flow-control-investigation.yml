@@ -22,19 +22,19 @@ jobs:
       max-parallel: 4
       matrix:
         include:
-          - name: i386-readyreader
+          - name: i386-a
             arch: '386'
             flags: ''
             pooling: 'true'
-          - name: i386-bufio
+          - name: i386-b
             arch: '386'
             flags: ''
             pooling: 'false'
-          - name: race-readyreader
+          - name: race-a
             arch: amd64
             flags: '-race'
             pooling: 'true'
-          - name: race-bufio
+          - name: race-b
             arch: amd64
             flags: '-race'
             pooling: 'false'
@@ -62,6 +62,7 @@ jobs:
             uname -a
             go env GOOS GOARCH GOTOOLCHAIN GOWORK
             printf 'HTTP framer read buffer pooling: %s\n' "$GRPC_GO_EXPERIMENTAL_HTTP_FRAMER_READ_BUFFER_POOLING"
+            printf 'Target ReadBufferSize=0 (raw TCP); pooling varies buffered readers in the root suite.\n'
             getconf _NPROCESSORS_ONLN
             free -h
             sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_moderate_rcvbuf net.core.rmem_max
@@ -73,11 +74,11 @@ jobs:
           base=39ebc82c352a3302c3d7f748b4359e26689d9187
           source="$RUNNER_TEMP/flow-control-source"
           logs="$RUNNER_TEMP/flow-control-logs"
-          patch="$GITHUB_WORKSPACE/scripts/flow-control-read-buffer.patch"
+          patch="$GITHUB_WORKSPACE/scripts/flow-control-fix.patch"
           git fetch --no-tags --depth=1 origin "$base"
           test "$(git rev-parse "$base^{commit}")" = "$base"
           mkdir -p "$source"
-          git archive "$base" | tar -x -C "$source"
+          git -c core.autocrlf=false archive "$base" | tar -x -C "$source"
           {
             printf 'Base commit: %s\n' "$base"
             printf 'Base tree: %s\n' "$(git rev-parse "$base^{tree}")"
@@ -90,8 +91,8 @@ jobs:
           cp "$patch" "$logs/candidate.patch"
           cd "$source"
           go test ${{ matrix.flags }} -c -o "$RUNNER_TEMP/flow-baseline.test" ./internal/transport
-          git apply --check "$patch"
-          git apply "$patch"
+          git -c core.autocrlf=false apply --check "$patch"
+          git -c core.autocrlf=false apply "$patch"
           diff_code=0
           diff -u --label a/internal/transport/transport_test.go --label b/internal/transport/transport_test.go "$RUNNER_TEMP/baseline-transport_test.go" internal/transport/transport_test.go > "$logs/candidate.diff" || diff_code=$?
           test "$diff_code" -eq 1
@@ -101,7 +102,9 @@ jobs:
             sha256sum internal/transport/transport_test.go
           } | tee -a "$logs/source-hashes.txt"
           go test ${{ matrix.flags }} -c -o "$RUNNER_TEMP/flow-candidate.test" ./internal/transport
-      - name: Verify clean candidate
+      - name: Run baseline (100 planned target executions)
+        id: baseline
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -110,27 +113,61 @@ jobs:
           summarizer="$GITHUB_WORKSPACE/scripts/flow-control-summary.py"
           baseline_code=0
           timeout --kill-after=5s 3m go tool test2json -t -p google.golang.org/grpc/internal/transport "$RUNNER_TEMP/flow-baseline.test" -test.v=test2json -test.run '^Test$/^AccountCheckWindowSizeWithLargeWindow$' -test.cpu 1,4 -test.count 50 -test.timeout 3m > "$logs/baseline.jsonl" 2>&1 || baseline_code=$?
+          printf 'exit_code=%s\n' "$baseline_code" >> "$GITHUB_OUTPUT"
           printf '{"stage":"baseline","exit_code":%s,"planned_target_executions":100}\n' "$baseline_code" | tee -a "$logs/results.jsonl"
           python3 "$summarizer" "$logs/baseline.jsonl" | tee "$logs/baseline-summary.txt"
           if [ "$baseline_code" -ne 0 ]; then
             echo "::notice::Unchanged baseline exited with status $baseline_code; continuing candidate validation."
           fi
+          exit "$baseline_code"
+      - name: Run candidate (1000 planned target executions)
+        id: candidate
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/flow-control-source"
+          logs="$RUNNER_TEMP/flow-control-logs"
+          summarizer="$GITHUB_WORKSPACE/scripts/flow-control-summary.py"
           candidate_code=0
           timeout --kill-after=5s 10m go tool test2json -t -p google.golang.org/grpc/internal/transport "$RUNNER_TEMP/flow-candidate.test" -test.v=test2json -test.run '^Test$/^AccountCheckWindowSizeWithLargeWindow$' -test.cpu 1,4 -test.count 500 -test.timeout 10m > "$logs/candidate.jsonl" 2>&1 || candidate_code=$?
+          printf 'exit_code=%s\n' "$candidate_code" >> "$GITHUB_OUTPUT"
           printf '{"stage":"candidate","exit_code":%s,"planned_target_executions":1000}\n' "$candidate_code" | tee -a "$logs/results.jsonl"
           python3 "$summarizer" "$logs/candidate.jsonl" | tee "$logs/candidate-summary.txt"
+          exit "$candidate_code"
+      - name: Run candidate root module
+        id: root_module
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/flow-control-source"
+          logs="$RUNNER_TEMP/flow-control-logs"
+          summarizer="$GITHUB_WORKSPACE/scripts/flow-control-summary.py"
           root_code=0
           timeout --kill-after=5s 9m go test -json ${{ matrix.flags }} -cpu 1,4 -timeout 7m ./... > "$logs/root-module.jsonl" 2>&1 || root_code=$?
+          printf 'exit_code=%s\n' "$root_code" >> "$GITHUB_OUTPUT"
           printf '{"stage":"root-module","exit_code":%s}\n' "$root_code" | tee -a "$logs/results.jsonl"
           python3 "$summarizer" "$logs/root-module.jsonl" | tee "$logs/root-module-summary.txt"
+          exit "$root_code"
+      - name: Report verification result
+        if: always()
+        shell: bash
+        env:
+          BASELINE_EXIT: ${{ steps.baseline.outputs.exit_code || 'not run' }}
+          CANDIDATE_EXIT: ${{ steps.candidate.outputs.exit_code || 'not run' }}
+          ROOT_EXIT: ${{ steps.root_module.outputs.exit_code || 'not run' }}
+          CANDIDATE_OUTCOME: ${{ steps.candidate.outcome }}
+          ROOT_OUTCOME: ${{ steps.root_module.outcome }}
+        run: |
+          set -euo pipefail
           {
             printf '| Stage | Exit status |\n| --- | --- |\n'
-            printf '| Unchanged baseline (100 planned target executions) | %s |\n' "$baseline_code"
-            printf '| Candidate (1000 planned target executions) | %s |\n' "$candidate_code"
-            printf '| Candidate root module | %s |\n' "$root_code"
+            printf '| Unchanged baseline (100 planned target executions) | %s |\n' "$BASELINE_EXIT"
+            printf '| Candidate (1000 planned target executions) | %s |\n' "$CANDIDATE_EXIT"
+            printf '| Candidate root module | %s |\n' "$ROOT_EXIT"
             printf '\nBaseline failures are recorded independently. Candidate and root-module results determine the job result.\n'
           } >> "$GITHUB_STEP_SUMMARY"
-          test "$candidate_code" -eq 0 && test "$root_code" -eq 0
+          test "$CANDIDATE_EXIT" = 0 && test "$ROOT_EXIT" = 0 && test "$CANDIDATE_OUTCOME" = success && test "$ROOT_OUTCOME" = success
       - name: Retain verification evidence
         if: always()
         uses: actions/upload-artifact@v4

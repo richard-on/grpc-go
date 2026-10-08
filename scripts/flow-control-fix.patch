@@ -1,0 +1,21 @@
+diff --git a/internal/transport/transport_test.go b/internal/transport/transport_test.go
+index 9f85005..5d507ea 100644
+--- a/internal/transport/transport_test.go
++++ b/internal/transport/transport_test.go
+@@ -2011,6 +2011,16 @@ func testFlowControlAccountCheck(t *testing.T, msgSize int, wc windowSizeConfig,
+ 	}
+ 	server.mu.Unlock()
+ 
++	// Fix the TCP receive buffer sizes to prevent kernel autotuning from
++	// shrinking them and stalling the loopback transfers on Linux.
++	if runtime.GOOS == "linux" {
++		for _, conn := range []net.Conn{client.conn, st.conn} {
++			if err := conn.(*net.TCPConn).SetReadBuffer(1024 * 1024); err != nil {
++				t.Fatalf("Failed to set TCP read buffer size: %v", err)
++			}
++		}
++	}
++
+ 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+ 	defer cancel()
+ 	const numStreams = 5
