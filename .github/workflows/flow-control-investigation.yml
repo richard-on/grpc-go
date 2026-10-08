@@ -1,0 +1,99 @@
+name: Flow-control investigation
+
+on:
+  push:
+    branches: [investigate/9371-flow-control]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flow-control-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  reproduce:
+    if: github.repository == 'richard-on/grpc-go'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - name: i386-a
+            arch: '386'
+            flags: ''
+            count: 500
+          - name: i386-b
+            arch: '386'
+            flags: ''
+            count: 500
+          - name: race-a
+            arch: amd64
+            flags: '-race'
+            count: 100
+          - name: race-b
+            arch: amd64
+            flags: '-race'
+            count: 100
+    name: ${{ matrix.name }}
+    env:
+      GOARCH: ${{ matrix.arch }}
+      GRPC_FLOW_DIAGNOSTICS: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - name: Record environment
+        run: |
+          go version
+          git rev-parse HEAD
+          uname -a
+          lscpu
+          free -h
+          sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_moderate_rcvbuf
+          mkdir -p "$RUNNER_TEMP/flow-control-logs"
+          cat /proc/net/netstat /proc/net/snmp /proc/net/softnet_stat > "$RUNNER_TEMP/flow-control-logs/network-before.txt"
+          cat /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io > "$RUNNER_TEMP/flow-control-logs/pressure-before.txt"
+      - name: Reproduce with the surrounding suite
+        run: |
+          result=0
+          for attempt in 1 2 3; do
+            log="$RUNNER_TEMP/flow-control-logs/suite-$attempt.jsonl"
+            code=0
+            go test ${{ matrix.flags }} -json -cpu 1,4 -count=1 -timeout 7m ./... > "$log" 2>&1 || code=$?
+            python3 scripts/flow-control-summary.py "$log"
+            if [ "$code" -ne 0 ]; then
+              result="$code"
+            fi
+            if python3 scripts/flow-control-summary.py --target-failed "$log"; then
+              break
+            fi
+          done
+          exit "$result"
+      - name: Repeat the target test
+        if: ${{ always() && !cancelled() }}
+        run: |
+          log="$RUNNER_TEMP/flow-control-logs/target.jsonl"
+          code=0
+          go test ${{ matrix.flags }} -json -run '^Test$/^AccountCheckWindowSizeWithLargeWindow$' -cpu 1,4 -count=${{ matrix.count }} -timeout 7m ./internal/transport > "$log" 2>&1 || code=$?
+          python3 scripts/flow-control-summary.py "$log"
+          exit "$code"
+      - name: Record final network and pressure counters
+        if: always()
+        run: |
+          cat /proc/net/netstat /proc/net/snmp /proc/net/softnet_stat > "$RUNNER_TEMP/flow-control-logs/network-after.txt"
+          cat /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io > "$RUNNER_TEMP/flow-control-logs/pressure-after.txt"
+      - name: Retain diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flow-control-${{ matrix.name }}
+          path: ${{ runner.temp }}/flow-control-logs
+          retention-days: 7
