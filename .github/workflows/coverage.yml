@@ -1,5 +1,8 @@
 name: codecov
-on: [push, pull_request]
+on:
+  push:
+    branches-ignore: [investigate/9371-flow-control]
+  pull_request:
 
 permissions:
   contents: read
