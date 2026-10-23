@@ -179,7 +179,9 @@ func (h *testStreamHandler) handleStreamPingPong(t *testing.T, s *ServerStream) 
 		buf[0] = byte(0)
 		binary.BigEndian.PutUint32(buf[1:], uint32(sz))
 		copy(buf[5:], msg)
-		s.Write(nil, newBufferSlice(buf), &WriteOptions{})
+		if err := s.Write(nil, newBufferSlice(buf), &WriteOptions{}); err != nil && os.Getenv("GRPC_FLOW_DIAGNOSTICS") == "1" {
+			fmt.Fprintf(os.Stderr, "FLOW_CONTROL_SERVER_WRITE_ERROR test=%s stream=%d error=%v\n", t.Name(), s.id, err)
+		}
 	}
 }
 
@@ -1992,6 +1994,7 @@ func testFlowControlAccountCheck(t *testing.T, msgSize int, wc windowSizeConfig,
 		StaticWindowSize:      true,
 		BufferPool:            mem.DefaultBufferPool(),
 	}
+	mode := configureFlowDiagnostics(t, sc, &co)
 	server, client, cancel := setUpWithOptionsAndTimeout(t, 0, sc, pingpong, co, timeout)
 	defer cancel()
 	defer server.stop()
@@ -2010,6 +2013,7 @@ func testFlowControlAccountCheck(t *testing.T, msgSize int, wc windowSizeConfig,
 		st = k.(*http2Server)
 	}
 	server.mu.Unlock()
+	prepareFlowSockets(t, mode, client, st)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -2022,6 +2026,8 @@ func testFlowControlAccountCheck(t *testing.T, msgSize int, wc windowSizeConfig,
 			t.Fatalf("Failed to create stream. Err: %v", err)
 		}
 	}
+	progress, stopDiagnostics := startFlowDiagnostics(t.Name(), client, st, clientStreams)
+	defer stopDiagnostics()
 	var wg sync.WaitGroup
 	// For each stream send pingpong messages to the server.
 	for _, stream := range clientStreams {
@@ -2034,16 +2040,19 @@ func testFlowControlAccountCheck(t *testing.T, msgSize int, wc windowSizeConfig,
 			opts := WriteOptions{}
 			header := make([]byte, 5)
 			for i := 1; i <= 5; i++ {
+				progress(stream.id, i, "write")
 				if err := stream.Write(nil, newBufferSlice(buf), &opts); err != nil {
 					t.Errorf("Error on client while writing message %v on stream %v: %v", i, stream.id, err)
 					return
 				}
+				progress(stream.id, i, "read_header")
 				if _, err := stream.readTo(header); err != nil {
 					t.Errorf("Error on client while reading data frame header %v on stream %v: %v", i, stream.id, err)
 					return
 				}
 				sz := binary.BigEndian.Uint32(header[1:])
 				recvMsg := make([]byte, int(sz))
+				progress(stream.id, i, "read_body")
 				if _, err := stream.readTo(recvMsg); err != nil {
 					t.Errorf("Error on client while reading data %v on stream %v: %v", i, stream.id, err)
 					return
@@ -2053,6 +2062,7 @@ func testFlowControlAccountCheck(t *testing.T, msgSize int, wc windowSizeConfig,
 					return
 				}
 			}
+			progress(stream.id, 5, "complete")
 			t.Logf("stream %v done with pingpongs", stream.id)
 		}(stream)
 	}

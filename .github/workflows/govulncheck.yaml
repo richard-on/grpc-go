@@ -1,6 +1,7 @@
 name: govulncheck
 on:
   push:
+    branches-ignore: [investigate/9371-flow-control]
   pull_request:
   schedule: # daily at 10:22 UTC
     - cron: '22 10 * * *'
